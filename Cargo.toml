@@ -1,0 +1,26 @@
+[package]
+name = "tun-rs-uring"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Linux-only async TUN/TAP device built around io_uring"
+repository = "https://github.com/xxoo/tun-rs-uring"
+rust-version = "1.75"
+readme = "README.md"
+keywords = ["tun", "tap", "io-uring", "async", "network"]
+categories = ["asynchronous", "network-programming", "os::linux-apis"]
+
+[features]
+default = []
+async = ["async_tokio"]
+async_tokio = ["dep:tokio"]
+async_io = ["dep:async-io"]
+
+[dependencies]
+async-channel = "=2.5"
+async-io = { version = "=2.3", optional = true }
+bytes = "1"
+io-uring = "=0.7"
+libc = "=0.2"
+tokio = { version = "=1.49", features = ["net", "rt", "time"], optional = true }
+tun-rs = "2.8.3"
