@@ -16,7 +16,6 @@ use std::{
     task::{Context, Poll, Waker},
     thread::{self, JoinHandle},
 };
-use tun_rs::SyncDevice;
 
 type DriverFuture<'a> = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>;
 
@@ -89,7 +88,7 @@ pub(crate) struct RxController<D = RxDriverHandle> {
 
 impl RxController<RxDriverHandle> {
     pub(crate) fn new(
-        device: SyncDevice,
+        device: OwnedFd,
         ring_entries: u32,
         buffer_len: usize,
         buffer_count: usize,
@@ -719,7 +718,7 @@ enum RxDriverCommand {
 
 struct RxDriverThread {
     ring: RxRingContext,
-    device: SyncDevice,
+    device: OwnedFd,
     shared: RxShared,
     commands: Receiver<RxDriverCommand>,
     command_eventfd: OwnedFd,
@@ -1022,7 +1021,7 @@ pub(crate) struct RxDriverHandle {
 
 impl RxDriverHandle {
     fn spawn(
-        device: SyncDevice,
+        device: OwnedFd,
         ring_entries: u32,
         buffer_len: usize,
         buffer_count: usize,

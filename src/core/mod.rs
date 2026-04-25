@@ -12,7 +12,10 @@ use bytes::Bytes;
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::os::fd::AsRawFd;
+#[cfg(any(feature = "async_tokio", feature = "async_io"))]
+use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
 use std::time::Duration;
 use tun_rs::SyncDevice;
 
@@ -26,7 +29,7 @@ pub(crate) use self::{
 /// Minimal shared device shell used by all runtime backends.
 #[allow(dead_code)]
 pub(crate) struct CoreDevice {
-    device: SyncDevice,
+    device: Arc<SyncDevice>,
     config: ValidatedConfig,
     packets_include_virtio_net_hdr: bool,
     rx: RxController,
@@ -51,11 +54,11 @@ impl CoreDevice {
             })
             .ok_or_else(|| error::invalid_input("effective rx buffer len overflows usize"))?;
         device.set_nonblocking(true)?;
-        let tx_device = duplicate_device(&device)?;
         let tx_ring_entries = config.tx_ring_entries;
         let tx_submit_chunk_size = config.tx_submit_chunk_size;
+        let device = Arc::new(device);
         let rx = RxController::new(
-            duplicate_device(&device)?,
+            duplicate_device_fd(&device)?,
             config.rx_ring_entries,
             rx_buffer_len,
             config.rx_buffer_count,
@@ -64,13 +67,19 @@ impl CoreDevice {
             config.rx_start_mode,
             rx_driver_name,
         )?;
+        let tx = TxController::new(
+            Arc::clone(&device),
+            tx_ring_entries,
+            tx_submit_chunk_size,
+            "uring-tx",
+        )?;
 
         Ok(Self {
             device,
             config,
             packets_include_virtio_net_hdr,
             rx,
-            tx: TxController::new(tx_device, tx_ring_entries, tx_submit_chunk_size, "uring-tx")?,
+            tx,
         })
     }
 
@@ -126,8 +135,16 @@ impl CoreDevice {
             .await
     }
 
-    pub(crate) fn duplicate_device(&self) -> std::io::Result<SyncDevice> {
-        duplicate_device(&self.device)
+    pub(crate) fn try_clone_device(&self) -> std::io::Result<SyncDevice> {
+        self.device.try_clone()
+    }
+
+    pub(crate) fn config(&self) -> UringDeviceConfig {
+        self.config.to_config()
+    }
+
+    pub(crate) fn duplicate_fd(&self) -> std::io::Result<OwnedFd> {
+        duplicate_device_fd(&self.device)
     }
 }
 
@@ -147,11 +164,21 @@ impl fmt::Debug for CoreDevice {
     }
 }
 
-pub(crate) fn duplicate_device(device: &SyncDevice) -> io::Result<SyncDevice> {
+pub(crate) fn duplicate_device_fd(device: &SyncDevice) -> io::Result<OwnedFd> {
     let duplicated = unsafe { libc::fcntl(device.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duplicated < 0 {
         return Err(io::Error::last_os_error());
     }
 
-    unsafe { SyncDevice::from_fd(duplicated) }
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+}
+
+#[cfg(any(feature = "async_tokio", feature = "async_io"))]
+pub(crate) fn write_fd(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
+    let written = unsafe { libc::write(fd, buf.as_ptr().cast::<libc::c_void>(), buf.len()) };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(written as usize)
 }

@@ -14,6 +14,10 @@ impl BackendDevice {
         Err(error::no_async_backend())
     }
 
+    pub(crate) fn try_clone_impl(&self) -> io::Result<Self> {
+        Err(error::no_async_backend())
+    }
+
     pub(crate) fn rx_state_impl(&self) -> RxState {
         RxState::Stopped
     }

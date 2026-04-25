@@ -1,5 +1,6 @@
-use crate::core::{CoreDevice, Packet, RxState, UringDeviceConfig};
+use crate::core::{write_fd, CoreDevice, Packet, RxState, UringDeviceConfig};
 use bytes::Bytes;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
 use std::{fmt, io};
 use tokio::io::unix::AsyncFd;
@@ -8,15 +9,19 @@ use tun_rs::SyncDevice;
 
 pub(crate) struct BackendDevice {
     core: CoreDevice,
-    io: AsyncFd<SyncDevice>,
+    io: AsyncFd<OwnedFd>,
 }
 
 impl BackendDevice {
     pub(crate) fn new_impl(device: SyncDevice, config: UringDeviceConfig) -> io::Result<Self> {
         let core = CoreDevice::new(device, config, "uring-rx-tokio")?;
-        let io = AsyncFd::new(core.duplicate_device()?)?;
+        let io = AsyncFd::new(core.duplicate_fd()?)?;
 
         Ok(Self { core, io })
+    }
+
+    pub(crate) fn try_clone_impl(&self) -> io::Result<Self> {
+        Self::new_impl(self.core.try_clone_device()?, self.core.config())
     }
 
     pub(crate) fn rx_state_impl(&self) -> RxState {
@@ -68,7 +73,7 @@ impl BackendDevice {
             }
 
             let mut guard = self.io.writable().await?;
-            match guard.try_io(|device| device.get_ref().send(buf)) {
+            match guard.try_io(|io| write_fd(io.get_ref().as_raw_fd(), buf)) {
                 Ok(result) => return result,
                 Err(_would_block) => continue,
             }

@@ -1,21 +1,26 @@
-use crate::core::{CoreDevice, Packet, RxState, UringDeviceConfig};
+use crate::core::{write_fd, CoreDevice, Packet, RxState, UringDeviceConfig};
 use async_io::{Async, Timer};
 use bytes::Bytes;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Duration;
 use std::{fmt, io};
 use tun_rs::SyncDevice;
 
 pub(crate) struct BackendDevice {
     core: CoreDevice,
-    io: Async<SyncDevice>,
+    io: Async<OwnedFd>,
 }
 
 impl BackendDevice {
     pub(crate) fn new_impl(device: SyncDevice, config: UringDeviceConfig) -> io::Result<Self> {
         let core = CoreDevice::new(device, config, "uring-rx-async-io")?;
-        let io = Async::new(core.duplicate_device()?)?;
+        let io = Async::new(core.duplicate_fd()?)?;
 
         Ok(Self { core, io })
+    }
+
+    pub(crate) fn try_clone_impl(&self) -> io::Result<Self> {
+        Self::new_impl(self.core.try_clone_device()?, self.core.config())
     }
 
     pub(crate) fn rx_state_impl(&self) -> RxState {
@@ -62,7 +67,7 @@ impl BackendDevice {
         match self.core.try_send(buf) {
             Ok(written) => Ok(written),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                self.io.write_with(|device| device.send(buf)).await
+                self.io.write_with(|fd| write_fd(fd.as_raw_fd(), buf)).await
             }
             Err(error) => Err(error),
         }

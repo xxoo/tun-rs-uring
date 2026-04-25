@@ -142,6 +142,12 @@ impl UringDeviceConfig {
 #[allow(dead_code)]
 pub(crate) struct ValidatedConfig(UringDeviceConfig);
 
+impl ValidatedConfig {
+    pub(crate) fn to_config(&self) -> UringDeviceConfig {
+        self.0.clone()
+    }
+}
+
 impl TryFrom<UringDeviceConfig> for ValidatedConfig {
     type Error = std::io::Error;
 

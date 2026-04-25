@@ -152,7 +152,7 @@ pub(crate) struct TxController {
 
 impl TxController {
     pub(crate) fn new(
-        device: SyncDevice,
+        device: Arc<SyncDevice>,
         ring_entries: u32,
         submit_chunk_size: usize,
         thread_name: &'static str,
@@ -440,7 +440,7 @@ impl Drop for TxRingContext {
 
 struct TxDriverThread {
     ring: TxRingContext,
-    device: SyncDevice,
+    device: Arc<SyncDevice>,
     commands: Receiver<TxDriverCommand>,
     command_eventfd: OwnedFd,
     shared: Arc<TxBatchShared>,

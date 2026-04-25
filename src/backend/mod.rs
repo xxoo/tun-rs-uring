@@ -44,6 +44,10 @@ impl BackendDevice {
         Self::new_impl(device, config)
     }
 
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        self.try_clone_impl()
+    }
+
     pub(crate) fn rx_state(&self) -> RxState {
         self.rx_state_impl()
     }

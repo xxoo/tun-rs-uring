@@ -29,6 +29,16 @@ impl UringDevice {
         })
     }
 
+    /// Creates a new `UringDevice` backed by a new multi-queue TUN/TAP queue.
+    ///
+    /// This delegates to the wrapped `SyncDevice::try_clone()` and reuses the
+    /// original `UringDeviceConfig` for the new instance.
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            inner: self.inner.try_clone()?,
+        })
+    }
+
     /// Returns the compile-time selected backend name.
     pub const fn backend_name() -> &'static str {
         backend::backend_name()
@@ -387,6 +397,23 @@ mod tests {
         target_os = "linux",
         not(target_env = "ohos")
     ))]
+    fn build_manual_start_multiqueue_device() -> io::Result<UringDevice> {
+        let device = DeviceBuilder::new()
+            .ipv4("10.26.1.100", 24, None)
+            .multi_queue(true)
+            .build_sync()?;
+        let config = UringDeviceConfig::default()
+            .with_rx_start_mode(RxStartMode::ManualStart)
+            .with_rx_buffer_count(128);
+
+        UringDevice::new(device, config)
+    }
+
+    #[cfg(all(
+        any(feature = "async_tokio", feature = "async_io"),
+        target_os = "linux",
+        not(target_env = "ohos")
+    ))]
     fn build_manual_start_offload_device_with_config(
         config: UringDeviceConfig,
     ) -> io::Result<Option<UringDevice>> {
@@ -430,6 +457,19 @@ mod tests {
             RxState::Faulted(error) => error.raw_os_error() == Some(raw_os_error),
             _ => false,
         }
+    }
+
+    #[cfg(all(
+        any(feature = "async_tokio", feature = "async_io"),
+        target_os = "linux",
+        not(target_env = "ohos")
+    ))]
+    fn exercise_try_clone_preserves_manual_start_config(device: UringDevice) -> io::Result<()> {
+        let mut cloned = device.try_clone()?;
+
+        assert!(matches!(cloned.rx_state(), RxState::Stopped));
+        assert_eq!(cloned.ready_len(), 0);
+        Ok(())
     }
 
     #[cfg(all(
@@ -1747,6 +1787,22 @@ mod tests {
 
     #[cfg(all(feature = "async_io", target_os = "linux", not(target_env = "ohos")))]
     #[test]
+    fn public_try_clone_creates_multiqueue_instance_async_io() {
+        let device = match build_manual_start_multiqueue_device() {
+            Ok(device) => device,
+            Err(error) if should_skip_live_public_rx_test(&error) => return,
+            Err(error) => panic!("unexpected UringDevice init failure: {error}"),
+        };
+
+        match exercise_try_clone_preserves_manual_start_config(device) {
+            Ok(()) => {}
+            Err(error) if should_skip_live_public_rx_test(&error) => {}
+            Err(error) => panic!("unexpected UringDevice try_clone failure: {error}"),
+        }
+    }
+
+    #[cfg(all(feature = "async_io", target_os = "linux", not(target_env = "ohos")))]
+    #[test]
     fn public_rx_api_receives_ipv4_packet_on_single_queue_tun_async_io() {
         let mut device = match build_manual_start_device() {
             Ok(device) => device,
@@ -2076,6 +2132,27 @@ mod tests {
             exercise_send_many_mixed_stress(&device, "tun-rs-uring async-io tx mixed stress")
         {
             panic!("unexpected send_many mixed stress failure: {error}");
+        }
+    }
+
+    #[cfg(all(feature = "async_tokio", target_os = "linux", not(target_env = "ohos")))]
+    #[test]
+    fn public_try_clone_creates_multiqueue_instance_async_tokio() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let device = match build_manual_start_multiqueue_device() {
+            Ok(device) => device,
+            Err(error) if should_skip_live_public_rx_test(&error) => return,
+            Err(error) => panic!("unexpected UringDevice init failure: {error}"),
+        };
+
+        match exercise_try_clone_preserves_manual_start_config(device) {
+            Ok(()) => {}
+            Err(error) if should_skip_live_public_rx_test(&error) => {}
+            Err(error) => panic!("unexpected UringDevice try_clone failure: {error}"),
         }
     }
 
