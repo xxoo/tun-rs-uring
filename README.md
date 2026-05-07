@@ -45,12 +45,6 @@ Enabling both backends in one build is rejected at compile time.
 - `send_many()` timeout is a real cancellation path: once requests were submitted, the API waits for cancel/drain before returning
 - multiqueue is not part of the current implementation scope
 
-Detailed design notes live in:
-
-- [URING_DEVICE_DESIGN.md](./URING_DEVICE_DESIGN.md)
-- [URING_DEVICE_IMPLEMENTATION_PLAN.md](./URING_DEVICE_IMPLEMENTATION_PLAN.md)
-- [URING_DEVICE_PROGRESS.md](./URING_DEVICE_PROGRESS.md)
-
 ## Examples
 
 The repository includes runnable examples under [`examples/`](./examples):

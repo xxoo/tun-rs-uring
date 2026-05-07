@@ -844,7 +844,7 @@ impl RxDriverThread {
     fn submit_multishot_read(&mut self) -> io::Result<()> {
         let entry = opcode::ReadMulti::new(
             types::Fd(self.device.as_raw_fd()),
-            self.ring.buffers.buffer_len() as u32,
+            0,
             self.ring.buffers.group_id(),
         )
         .build()
