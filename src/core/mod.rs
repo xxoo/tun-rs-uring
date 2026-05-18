@@ -23,7 +23,10 @@ pub use self::config::UringDeviceConfig;
 pub use self::packet::{GsoType, OffloadInfo, Packet};
 pub use self::rx::{RxStartMode, RxState};
 pub(crate) use self::{
-    config::ValidatedConfig, packet::PacketRecycle, rx::RxController, tx::TxController,
+    config::ValidatedConfig,
+    packet::PacketRecycle,
+    rx::{RxController, RxControllerConfig},
+    tx::TxController,
 };
 
 /// Minimal shared device shell used by all runtime backends.
@@ -57,16 +60,16 @@ impl CoreDevice {
         let tx_ring_entries = config.tx_ring_entries;
         let tx_submit_chunk_size = config.tx_submit_chunk_size;
         let device = Arc::new(device);
-        let rx = RxController::new(
-            duplicate_device_fd(&device)?,
-            config.rx_ring_entries,
-            rx_buffer_len,
-            config.rx_buffer_count,
+        let rx = RxController::new(RxControllerConfig {
+            device: duplicate_device_fd(&device)?,
+            ring_entries: config.rx_ring_entries,
+            buffer_len: rx_buffer_len,
+            buffer_count: config.rx_buffer_count,
             packets_include_virtio_net_hdr,
-            config.rx_auto_resume_after_recycled_slots,
-            config.rx_start_mode,
-            rx_driver_name,
-        )?;
+            auto_resume_after_recycled_slots: config.rx_auto_resume_after_recycled_slots,
+            start_mode: config.rx_start_mode,
+            thread_name: rx_driver_name,
+        })?;
         let tx = TxController::new(
             Arc::clone(&device),
             tx_ring_entries,

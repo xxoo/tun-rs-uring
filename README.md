@@ -38,7 +38,7 @@ Enabling both backends in one build is rejected at compile time.
 - `keep_order` does not provide global ordering against concurrent `send()` or `try_send()`
 - `keep_order` currently uses conservative linked chunks: one chain settles before the next chain is submitted
 - `Packet::offload_info()` is lazily parsed from the virtio header only when first used
-- `Packet::as_bytes()` and `len()` exclude the virtio header even when RX offload is enabled
+- `Packet::as_bytes()` and `len()` return the complete RX buffer, including the virtio header when RX offload is enabled
 - `Packet::split_into()` is available for manual GSO splitting on offload-enabled RX packets
 - All send methods assume you handled virtio net headers correctly on offload-enabled devices
 - In ordered mode, a link break can propagate `ECANCELED` to later entries in the same linked chunk
@@ -82,6 +82,14 @@ Example compile smoke:
 cargo check --examples --no-default-features --features async_tokio
 cargo check --examples --no-default-features --features async_io
 ```
+
+Strict live/audit run:
+
+```bash
+./scripts/audit_reliability_performance.sh
+```
+
+The audit script builds as the current user, discovers the backend test binaries with Cargo JSON output, and only uses root over SSH to execute already-built binaries. Set `TUN_RS_URING_REQUIRE_LIVE=1` to make live tests and examples fail instead of skipping when TUN permissions or devices are unavailable; the audit script sets this explicitly for root SSH stages.
 
 ## Current Status
 

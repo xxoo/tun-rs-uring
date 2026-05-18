@@ -38,12 +38,21 @@ pub struct Packet {
 }
 
 impl Packet {
+    /// Returns the complete packet buffer as received.
+    ///
+    /// When RX offload is enabled this includes the virtio net header. Use
+    /// [`Packet::split_into`] when segmenting GSO packets for an egress path
+    /// that does not accept GSO.
     pub fn as_bytes(&self) -> &[u8] {
         self.bytes.raw_bytes()
     }
 
     pub fn len(&self) -> usize {
-        self.bytes.len()
+        self.as_bytes().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn is_detached(&self) -> bool {
@@ -72,7 +81,7 @@ impl Packet {
     ) -> io::Result<usize> {
         match self.offload_info() {
             Some(info) => {
-                let payload = &self.as_bytes()[VIRTIO_NET_HDR_LEN..];
+                let payload = self.view.payload_bytes(&self.bytes);
                 if info.gso_type == GsoType::None || info.gso_size == 0 {
                     if info.needs_csum {
                         let mut copy = payload.to_vec();
@@ -196,6 +205,14 @@ impl PacketView {
             .as_ref()
     }
 
+    fn payload_bytes<'a>(&self, bytes: &'a PacketBytes) -> &'a [u8] {
+        let raw = bytes.raw_bytes();
+        if raw.len() < self.payload_offset {
+            return &[];
+        }
+        &raw[self.payload_offset..]
+    }
+
     fn parse_offload_info(&self, bytes: &PacketBytes) -> Option<OffloadInfo> {
         if self.payload_offset != VIRTIO_NET_HDR_LEN {
             return None;
@@ -238,13 +255,6 @@ impl PacketBytes {
             Self::Borrowed { addr, len } => unsafe {
                 std::slice::from_raw_parts((*addr) as *const u8, *len)
             },
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Self::Owned(bytes) => bytes.len(),
-            Self::Borrowed { len, .. } => *len,
         }
     }
 
@@ -650,6 +660,15 @@ mod tests {
         assert!(packet.is_detached());
         assert_eq!(packet.as_bytes(), &[1, 2, 3]);
         assert_eq!(packet.len(), 3);
+        assert!(!packet.is_empty());
+    }
+
+    #[test]
+    fn empty_packet_reports_empty() {
+        let packet = Packet::from_owned(Vec::new());
+
+        assert_eq!(packet.len(), 0);
+        assert!(packet.is_empty());
     }
 
     #[test]
@@ -808,11 +827,14 @@ mod tests {
     fn packet_lazily_parses_offload_info_from_virtio_header() {
         let payload = build_ipv4_udp_packet(b"lazy offload");
         let raw_packet = prepend_virtio_net_hdr(payload.clone(), 0, 0, 28, 0, 20, 6);
-        let packet =
-            Packet::from_recyclable_with_virtio_net_hdr(raw_packet, RecycleCounter::new().token());
+        let packet = Packet::from_recyclable_with_virtio_net_hdr(
+            raw_packet.clone(),
+            RecycleCounter::new().token(),
+        );
 
-        assert_eq!(&packet.as_bytes()[VIRTIO_NET_HDR_LEN..], payload.as_slice());
-        assert_eq!(packet.len(), payload.len() + VIRTIO_NET_HDR_LEN);
+        assert_eq!(packet.as_bytes(), raw_packet.as_slice());
+        assert_eq!(packet.view.payload_bytes(&packet.bytes), payload.as_slice());
+        assert_eq!(packet.len(), raw_packet.len());
         assert!(!packet.is_gso());
 
         let info = packet.offload_info().unwrap();
@@ -828,6 +850,7 @@ mod tests {
         let raw_packet = build_ipv4_udp_partial_checksum_packet(b"plain packet");
         let original_packet_bytes = raw_packet[VIRTIO_NET_HDR_LEN..].to_vec();
         let packet_bytes = build_ipv4_udp_packet(b"plain packet");
+        let raw_packet_clone = raw_packet.clone();
         let packet =
             Packet::from_recyclable_with_virtio_net_hdr(raw_packet, RecycleCounter::new().token());
         let mut out = [vec![0u8; 128]];
@@ -843,8 +866,9 @@ mod tests {
             &packet_bytes[20 + UDP_HEADER_LEN..]
         );
         assert_ne!(u16::from_be_bytes([out[0][30], out[0][31]]), 0);
+        assert_eq!(packet.as_bytes(), raw_packet_clone.as_slice());
         assert_eq!(
-            &packet.as_bytes()[VIRTIO_NET_HDR_LEN..],
+            packet.view.payload_bytes(&packet.bytes),
             original_packet_bytes.as_slice()
         );
     }
@@ -853,8 +877,9 @@ mod tests {
     fn split_into_splits_ipv4_udp_packet() {
         let payloads = [b"ABCD".as_slice(), b"EFG".as_slice()];
         let packet_bytes = build_ipv4_udp_packet(&payloads.concat());
+        let raw_packet = build_ipv4_udp_gso_packet(&payloads);
         let packet = Packet::from_recyclable_with_virtio_net_hdr(
-            build_ipv4_udp_gso_packet(&payloads),
+            raw_packet.clone(),
             RecycleCounter::new().token(),
         );
         let mut out = [vec![0u8; 128], vec![0u8; 128]];
@@ -870,8 +895,9 @@ mod tests {
         assert_eq!(u16::from_be_bytes([out[1][26], out[1][27]]), 11);
         assert_eq!(&out[0][30..34], payloads[0]);
         assert_eq!(&out[1][30..33], payloads[1]);
+        assert_eq!(packet.as_bytes(), raw_packet.as_slice());
         assert_eq!(
-            &packet.as_bytes()[VIRTIO_NET_HDR_LEN..],
+            packet.view.payload_bytes(&packet.bytes),
             packet_bytes.as_slice()
         );
     }
@@ -881,7 +907,8 @@ mod tests {
         let payloads = [b"segment-1".as_slice(), b"tail".as_slice()];
         let packet_bytes = build_ipv4_udp_packet(&payloads.concat());
         let count = Arc::new(AtomicUsize::new(0));
-        let mut bytes = build_ipv4_udp_gso_packet(&payloads).into_boxed_slice();
+        let raw_packet = build_ipv4_udp_gso_packet(&payloads);
+        let mut bytes = raw_packet.clone().into_boxed_slice();
         let mut packet = Packet::from_ring_with_virtio_net_hdr(
             bytes.as_mut_ptr() as usize,
             bytes.len(),
@@ -913,8 +940,9 @@ mod tests {
             before_out[1][..before_sizes[1]],
             after_out[1][..after_sizes[1]]
         );
+        assert_eq!(packet.as_bytes(), raw_packet.as_slice());
         assert_eq!(
-            &packet.as_bytes()[VIRTIO_NET_HDR_LEN..],
+            packet.view.payload_bytes(&packet.bytes),
             packet_bytes.as_slice()
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);

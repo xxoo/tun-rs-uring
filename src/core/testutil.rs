@@ -1,3 +1,5 @@
+#[cfg(any(feature = "async_tokio", feature = "async_io"))]
+use std::time::Duration;
 use std::{
     future::Future,
     mem::ManuallyDrop,
@@ -8,12 +10,8 @@ use std::{
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
-#[cfg(any(feature = "async_tokio", feature = "async_io"))]
-use std::{
-    task::Wake,
-    thread,
-    time::{Duration, Instant},
-};
+#[cfg(all(not(feature = "async_tokio"), feature = "async_io"))]
+use std::{task::Wake, thread, time::Instant};
 
 #[derive(Clone, Default)]
 pub(crate) struct WakeCounter {
@@ -74,12 +72,12 @@ where
     }
 }
 
-#[cfg(any(feature = "async_tokio", feature = "async_io"))]
+#[cfg(all(not(feature = "async_tokio"), feature = "async_io"))]
 struct ThreadWaker {
     thread: thread::Thread,
 }
 
-#[cfg(any(feature = "async_tokio", feature = "async_io"))]
+#[cfg(all(not(feature = "async_tokio"), feature = "async_io"))]
 impl Wake for ThreadWaker {
     fn wake(self: Arc<Self>) {
         self.thread.unpark();
@@ -90,7 +88,21 @@ impl Wake for ThreadWaker {
     }
 }
 
-#[cfg(any(feature = "async_tokio", feature = "async_io"))]
+#[cfg(feature = "async_tokio")]
+pub(crate) fn block_on_timeout<F>(future: F, timeout: Duration) -> Option<F::Output>
+where
+    F: Future,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .ok()?;
+
+    runtime.block_on(async { tokio::time::timeout(timeout, future).await.ok() })
+}
+
+#[cfg(all(not(feature = "async_tokio"), feature = "async_io"))]
 pub(crate) fn block_on_timeout<F>(future: F, timeout: Duration) -> Option<F::Output>
 where
     F: Future,

@@ -136,6 +136,10 @@ fn ipv4_checksum(header: &[u8]) -> u16 {
 }
 
 fn should_skip_live_example(error: &io::Error) -> bool {
+    if live_examples_are_required() {
+        return false;
+    }
+
     matches!(
         error.raw_os_error(),
         Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::ENOENT | libc::ENODEV)
@@ -143,4 +147,10 @@ fn should_skip_live_example(error: &io::Error) -> bool {
         error.kind(),
         io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
     )
+}
+
+fn live_examples_are_required() -> bool {
+    std::env::var("TUN_RS_URING_REQUIRE_LIVE").is_ok_and(|value| {
+        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+    })
 }
