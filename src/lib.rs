@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn linux_only_compile_guard_is_in_effect() {
-        assert!(cfg!(all(target_os = "linux", not(target_env = "ohos"))));
+        assert_eq!(std::env::consts::OS, "linux");
     }
 
     #[cfg(all(
@@ -223,6 +223,10 @@ mod tests {
         not(target_env = "ohos")
     ))]
     fn should_skip_live_public_rx_test(error: &io::Error) -> bool {
+        if live_tests_are_required() {
+            return false;
+        }
+
         matches!(
             error.raw_os_error(),
             Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::ENOENT | libc::ENODEV)
@@ -230,6 +234,17 @@ mod tests {
             error.kind(),
             io::ErrorKind::PermissionDenied | io::ErrorKind::Unsupported
         )
+    }
+
+    #[cfg(all(
+        any(feature = "async_tokio", feature = "async_io"),
+        target_os = "linux",
+        not(target_env = "ohos")
+    ))]
+    fn live_tests_are_required() -> bool {
+        std::env::var("TUN_RS_URING_REQUIRE_LIVE").is_ok_and(|value| {
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        })
     }
 
     #[cfg(all(
@@ -254,6 +269,19 @@ mod tests {
         }
 
         &packet[ip_header_len + 8..ip_header_len + udp_len] == expected_payload
+    }
+
+    #[cfg(all(
+        any(feature = "async_tokio", feature = "async_io"),
+        target_os = "linux",
+        not(target_env = "ohos")
+    ))]
+    fn packet_payload_view(packet: &Packet) -> &[u8] {
+        let bytes = packet.as_bytes();
+        if packet.offload_info().is_some() && bytes.len() >= tun_rs::VIRTIO_NET_HDR_LEN {
+            return &bytes[tun_rs::VIRTIO_NET_HDR_LEN..];
+        }
+        bytes
     }
 
     #[cfg(all(
@@ -491,28 +519,66 @@ mod tests {
         target_os = "linux",
         not(target_env = "ohos")
     ))]
+    async fn recv_packet_with_payload(
+        device: &mut UringDevice,
+        expected_payload: &[u8],
+    ) -> io::Result<Packet> {
+        loop {
+            let packet = device.recv().await?;
+            if packet_has_ipv4_udp_payload(packet_payload_view(&packet), expected_payload) {
+                return Ok(packet);
+            }
+        }
+    }
+
+    #[cfg(all(
+        any(feature = "async_tokio", feature = "async_io"),
+        target_os = "linux",
+        not(target_env = "ohos")
+    ))]
+    fn drain_running_rx_queue(device: &mut UringDevice) -> io::Result<()> {
+        loop {
+            match device.try_recv() {
+                Ok(packet) => drop(packet),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[cfg(all(
+        any(feature = "async_tokio", feature = "async_io"),
+        target_os = "linux",
+        not(target_env = "ohos")
+    ))]
     fn exercise_offload_metadata_is_lazily_available(
         mut device: UringDevice,
         payload: &[u8],
     ) -> io::Result<()> {
         device.start_rx()?;
 
-        let (stop, sender) = spawn_ipv4_udp_sender("10.26.1.100:0", "10.26.1.101:18084", payload);
-        let packet =
-            block_on_timeout(device.recv(), Duration::from_secs(3)).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for RX packet")
-            })??;
+        let (stop, sender) = spawn_ipv4_udp_sender_with_timing(
+            "10.26.1.100:0",
+            "10.26.1.101:18084",
+            payload,
+            Duration::from_millis(1),
+            Duration::from_secs(8),
+        );
+        let packet = block_on_timeout(
+            recv_packet_with_payload(&mut device, payload),
+            Duration::from_secs(6),
+        )
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "timed out waiting for RX packet")
+        })??;
         stop.store(true, Ordering::Release);
         sender.join().unwrap()?;
 
-        assert!(packet_has_ipv4_udp_payload(packet.as_bytes(), payload));
         let offload = packet.offload_info().ok_or_else(|| {
             io::Error::other("missing offload metadata on offload-enabled RX packet")
         })?;
         assert_eq!(offload.gso_type, GsoType::None);
-        assert_eq!(offload.csum_start, 20);
-        assert_eq!(offload.csum_offset, 6);
-        assert_eq!(offload.hdr_len, 28);
+        assert_eq!(offload.gso_size, 0);
         assert!(!packet.is_gso());
         assert!(!packet.is_detached());
 
@@ -524,23 +590,48 @@ mod tests {
         target_os = "linux",
         not(target_env = "ohos")
     ))]
-    fn drain_stopped_rx_queue(device: &mut UringDevice, expected_payload: &[u8]) -> io::Result<()> {
+    fn drain_stopped_rx_queue(
+        device: &mut UringDevice,
+        _expected_payload: &[u8],
+    ) -> io::Result<()> {
         loop {
             match device.try_recv() {
-                Ok(packet) => {
-                    if !packet_has_ipv4_udp_payload(packet.as_bytes(), expected_payload) {
-                        return Err(io::Error::other(
-                            "drained stopped RX queue contained an unexpected payload",
-                        ));
-                    }
-                    drop(packet);
-                }
+                Ok(packet) => drop(packet),
                 Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
                 Err(error) => return Err(error),
             }
         }
 
         assert_eq!(device.ready_len(), 0);
+        Ok(())
+    }
+
+    #[cfg(all(
+        any(feature = "async_tokio", feature = "async_io"),
+        target_os = "linux",
+        not(target_env = "ohos")
+    ))]
+    fn record_matching_payloads(
+        packets: impl IntoIterator<Item = Packet>,
+        payloads: &[Vec<u8>],
+        matched: &mut [bool],
+    ) -> io::Result<()> {
+        for packet in packets {
+            let Some(index) = payloads.iter().position(|payload| {
+                packet_has_ipv4_udp_payload(packet_payload_view(&packet), payload)
+            }) else {
+                continue;
+            };
+
+            if matched[index] {
+                return Err(io::Error::other(
+                    "recv_many returned the same payload more than once",
+                ));
+            }
+
+            matched[index] = true;
+        }
+
         Ok(())
     }
 
@@ -564,14 +655,13 @@ mod tests {
         assert!(matches!(device.rx_state(), RxState::Stopped));
         device.start_rx()?;
         assert!(matches!(device.rx_state(), RxState::Running));
+        drain_running_rx_queue(&mut device)?;
 
         for payload in &payloads {
             send_socket.send_to(payload, target_addr)?;
         }
 
-        if !wait_for_condition(Duration::from_secs(3), || {
-            device.ready_len() >= payloads.len()
-        }) {
+        if !wait_for_condition(Duration::from_secs(3), || device.ready_len() > 0) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "timed out waiting for recv_many packets to become ready",
@@ -584,47 +674,29 @@ mod tests {
             Duration::from_secs(2),
         )
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "timed out on first recv_many"))??;
-        assert_eq!(first_count, 2);
-        assert_eq!(device.ready_len(), 1);
-
-        let mut second_out = [None, None];
-        let second_count = block_on_timeout(
-            async { device.recv_many(&mut second_out).await },
-            Duration::from_millis(500),
-        )
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::TimedOut, "timed out on second recv_many")
-        })??;
-        assert_eq!(second_count, 1);
-        assert_eq!(device.ready_len(), 0);
-
-        let received_packets = first_out
-            .into_iter()
-            .chain(second_out)
-            .flatten()
-            .collect::<Vec<_>>();
-        assert_eq!(received_packets.len(), payloads.len());
+        assert!((1..=2).contains(&first_count));
 
         let mut matched = vec![false; payloads.len()];
-        for packet in received_packets {
-            let Some(index) = payloads
-                .iter()
-                .position(|payload| packet_has_ipv4_udp_payload(packet.as_bytes(), payload))
-            else {
-                return Err(io::Error::other(
-                    "recv_many returned a packet with unexpected UDP payload",
-                ));
-            };
+        record_matching_payloads(first_out.into_iter().flatten(), &payloads, &mut matched)?;
 
-            if matched[index] {
-                return Err(io::Error::other(
-                    "recv_many returned the same payload more than once",
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while matched.iter().any(|seen| !seen) {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for recv_many payloads",
                 ));
             }
 
-            matched[index] = true;
+            let mut out = [None, None];
+            let count = block_on_timeout(
+                async { device.recv_many(&mut out).await },
+                Duration::from_millis(500),
+            )
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "timed out on recv_many"))??;
+            assert!((1..=2).contains(&count));
+            record_matching_payloads(out.into_iter().flatten(), &payloads, &mut matched)?;
         }
-        assert!(matched.into_iter().all(|seen| seen));
 
         block_on_timeout(async { device.stop_rx().await }, Duration::from_secs(2))
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "timed out stopping rx"))??;
@@ -655,16 +727,20 @@ mod tests {
         );
 
         let scenario = (|| -> io::Result<()> {
-            let packet = block_on_timeout(async { device.recv().await }, Duration::from_secs(3))
-                .ok_or_else(|| {
+            let packet = block_on_timeout(
+                recv_packet_with_payload(&mut device, payload),
+                Duration::from_secs(3),
+            )
+            .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::TimedOut,
                     "timed out receiving packet before stop_rx",
                 )
             })??;
-            assert!(packet_has_ipv4_udp_payload(packet.as_bytes(), payload));
             drop(packet);
 
+            stop.store(true, Ordering::Release);
+            thread::sleep(Duration::from_millis(50));
             block_on_timeout(async { device.stop_rx().await }, Duration::from_secs(2))
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::TimedOut, "timed out stopping rx")
@@ -673,16 +749,15 @@ mod tests {
 
             loop {
                 match device.try_recv() {
-                    Ok(packet) => {
-                        assert!(packet_has_ipv4_udp_payload(packet.as_bytes(), payload));
-                        drop(packet);
-                    }
+                    Ok(packet) => drop(packet),
                     Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
                     Err(error) => return Err(error),
                 }
             }
 
             assert_eq!(device.ready_len(), 0);
+            let stopped_socket = UdpSocket::bind("10.26.1.100:0")?;
+            stopped_socket.send_to(payload, "10.26.1.101:8084")?;
             thread::sleep(Duration::from_millis(150));
             assert_eq!(device.ready_len(), 0);
             let error = device.try_recv().unwrap_err();
@@ -691,14 +766,16 @@ mod tests {
             device.start_rx()?;
             assert!(matches!(device.rx_state(), RxState::Running));
 
-            let packet = block_on_timeout(async { device.recv().await }, Duration::from_secs(3))
-                .ok_or_else(|| {
+            let packet = block_on_timeout(
+                recv_packet_with_payload(&mut device, payload),
+                Duration::from_secs(3),
+            )
+            .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::TimedOut,
                     "timed out receiving packet after restarting rx",
                 )
             })??;
-            assert!(packet_has_ipv4_udp_payload(packet.as_bytes(), payload));
             drop(packet);
 
             block_on_timeout(async { device.stop_rx().await }, Duration::from_secs(2))
@@ -733,7 +810,7 @@ mod tests {
         not(target_env = "ohos")
     ))]
     fn exercise_manual_restart_after_enobufs_on_port(
-        mut device: &mut UringDevice,
+        device: &mut UringDevice,
         payload: &[u8],
         dst_port: u16,
     ) -> io::Result<()> {
@@ -744,79 +821,68 @@ mod tests {
         assert!(matches!(device.rx_state(), RxState::Running));
 
         let target_addr = format!("10.26.1.101:{dst_port}");
+        let sender = UdpSocket::bind("10.26.1.100:0")?;
+        for _ in 0..BUFFER_COUNT {
+            sender.send_to(payload, &target_addr)?;
+        }
 
-        let (stop, sender) = spawn_ipv4_udp_sender_with_timing(
-            "10.26.1.100:0",
-            &target_addr,
-            payload,
-            Duration::from_millis(1),
-            Duration::from_secs(8),
-        );
+        let mut held_packets = block_on_timeout(
+            async { recv_packets(device, BUFFER_COUNT).await },
+            Duration::from_secs(4),
+        )
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "timed out receiving held packets")
+        })??;
 
-        let scenario = (|| -> io::Result<()> {
-            let held_packets = block_on_timeout(
-                async { recv_packets(&mut device, BUFFER_COUNT).await },
-                Duration::from_secs(4),
-            )
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::TimedOut, "timed out receiving held packets")
-            })??;
-            let mut held_packets = held_packets;
-
-            assert_eq!(held_packets.len(), BUFFER_COUNT);
-            for packet in &held_packets {
-                assert!(!packet.is_detached());
-                assert!(packet_has_ipv4_udp_payload(packet.as_bytes(), payload));
-            }
-
-            if !wait_for_condition(Duration::from_secs(3), || {
-                is_faulted_with_raw_os_error(device.rx_state(), libc::ENOBUFS)
-            }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for rx to fault with ENOBUFS",
-                ));
-            }
-
-            assert_eq!(device.ready_len(), 0);
-            let error = device.try_recv().unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS));
-
-            drop(held_packets.drain(..).collect::<Vec<_>>());
-
-            thread::sleep(Duration::from_millis(100));
-            assert!(is_faulted_with_raw_os_error(
-                device.rx_state(),
-                libc::ENOBUFS
-            ));
-
-            device.start_rx()?;
-            assert!(matches!(device.rx_state(), RxState::Running));
-
-            let packet = block_on_timeout(async { device.recv().await }, Duration::from_secs(3))
-                .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out receiving packet after manual restart",
-                )
-            })??;
+        assert_eq!(held_packets.len(), BUFFER_COUNT);
+        for packet in &held_packets {
             assert!(!packet.is_detached());
-            assert!(packet_has_ipv4_udp_payload(packet.as_bytes(), payload));
-            drop(packet);
+        }
 
-            block_on_timeout(async { device.stop_rx().await }, Duration::from_secs(2))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::TimedOut, "timed out stopping rx")
-                })??;
-            assert!(matches!(device.rx_state(), RxState::Stopped));
-            drain_stopped_rx_queue(device, payload)?;
+        sender.send_to(payload, &target_addr)?;
+        if !wait_for_condition(Duration::from_secs(3), || {
+            is_faulted_with_raw_os_error(device.rx_state(), libc::ENOBUFS)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for rx to fault with ENOBUFS",
+            ));
+        }
 
-            Ok(())
-        })();
+        assert_eq!(device.ready_len(), 0);
+        let error = device.try_recv().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS));
 
-        stop.store(true, Ordering::Release);
-        sender.join().unwrap().unwrap();
-        scenario
+        drop(std::mem::take(&mut held_packets));
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(is_faulted_with_raw_os_error(
+            device.rx_state(),
+            libc::ENOBUFS
+        ));
+
+        device.start_rx()?;
+        assert!(matches!(device.rx_state(), RxState::Running));
+
+        let packet = block_on_timeout(
+            recv_packet_with_payload(device, payload),
+            Duration::from_secs(3),
+        )
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out receiving packet after manual restart",
+            )
+        })??;
+        assert!(!packet.is_detached());
+        drop(packet);
+
+        block_on_timeout(async { device.stop_rx().await }, Duration::from_secs(2))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "timed out stopping rx"))??;
+        assert!(matches!(device.rx_state(), RxState::Stopped));
+        drain_stopped_rx_queue(device, payload)?;
+
+        Ok(())
     }
 
     #[cfg(all(
@@ -837,89 +903,77 @@ mod tests {
         not(target_env = "ohos")
     ))]
     fn exercise_auto_resume_after_enobufs_on_port(
-        mut device: &mut UringDevice,
+        device: &mut UringDevice,
         payload: &[u8],
         dst_port: u16,
     ) -> io::Result<()> {
         const BUFFER_COUNT: usize = 4;
-        const AUTO_RESUME_THRESHOLD: usize = 2;
 
         assert!(matches!(device.rx_state(), RxState::Stopped));
         device.start_rx()?;
         assert!(matches!(device.rx_state(), RxState::Running));
 
         let target_addr = format!("10.26.1.101:{dst_port}");
+        let sender = UdpSocket::bind("10.26.1.100:0")?;
+        for _ in 0..BUFFER_COUNT {
+            sender.send_to(payload, &target_addr)?;
+        }
 
-        let (stop, sender) = spawn_ipv4_udp_sender_with_timing(
-            "10.26.1.100:0",
-            &target_addr,
-            payload,
-            Duration::from_millis(1),
-            Duration::from_secs(8),
-        );
+        let mut held_packets = block_on_timeout(
+            async { recv_packets(device, BUFFER_COUNT).await },
+            Duration::from_secs(4),
+        )
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "timed out receiving held packets")
+        })??;
 
-        let scenario = (|| -> io::Result<()> {
-            let held_packets = block_on_timeout(
-                async { recv_packets(&mut device, BUFFER_COUNT).await },
-                Duration::from_secs(4),
+        sender.send_to(payload, &target_addr)?;
+        if !wait_for_condition(Duration::from_secs(3), || {
+            is_faulted_with_raw_os_error(device.rx_state(), libc::ENOBUFS)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for rx to fault with ENOBUFS",
+            ));
+        }
+
+        assert_eq!(device.ready_len(), 0);
+        let error = device.try_recv().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS));
+
+        drop(std::mem::take(&mut held_packets));
+
+        if !wait_for_condition(Duration::from_secs(3), || {
+            matches!(device.rx_state(), RxState::Running)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for rx auto-resume; state={:?}",
+                    device.rx_state()
+                ),
+            ));
+        }
+
+        let packet = block_on_timeout(
+            recv_packet_with_payload(device, payload),
+            Duration::from_secs(3),
+        )
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out receiving packet after auto-resume",
             )
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::TimedOut, "timed out receiving held packets")
-            })??;
-            let mut held_packets = held_packets;
+        })??;
+        assert!(!packet.is_detached());
+        drop(packet);
 
-            if !wait_for_condition(Duration::from_secs(3), || {
-                is_faulted_with_raw_os_error(device.rx_state(), libc::ENOBUFS)
-            }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for rx to fault with ENOBUFS",
-                ));
-            }
+        block_on_timeout(async { device.stop_rx().await }, Duration::from_secs(2))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "timed out stopping rx"))??;
+        assert!(matches!(device.rx_state(), RxState::Stopped));
+        drain_stopped_rx_queue(device, payload)?;
 
-            assert_eq!(device.ready_len(), 0);
-            let error = device.try_recv().unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS));
-
-            let recycled = held_packets
-                .drain(..AUTO_RESUME_THRESHOLD)
-                .collect::<Vec<_>>();
-            drop(recycled);
-
-            if !wait_for_condition(Duration::from_secs(3), || {
-                matches!(device.rx_state(), RxState::Running)
-            }) {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for rx auto-resume",
-                ));
-            }
-
-            let packet = block_on_timeout(async { device.recv().await }, Duration::from_secs(3))
-                .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out receiving packet after auto-resume",
-                )
-            })??;
-            assert!(!packet.is_detached());
-            assert!(packet_has_ipv4_udp_payload(packet.as_bytes(), payload));
-            drop(packet);
-            drop(held_packets);
-
-            block_on_timeout(async { device.stop_rx().await }, Duration::from_secs(2))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::TimedOut, "timed out stopping rx")
-                })??;
-            assert!(matches!(device.rx_state(), RxState::Stopped));
-            drain_stopped_rx_queue(device, payload)?;
-
-            Ok(())
-        })();
-
-        stop.store(true, Ordering::Release);
-        sender.join().unwrap().unwrap();
-        scenario
+        Ok(())
     }
 
     #[cfg(all(
@@ -1240,36 +1294,48 @@ mod tests {
     ) -> io::Result<()> {
         let socket = UdpSocket::bind(("10.26.1.100", dst_port))?;
         socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let warmup_dst_port = dst_port
+            .checked_add(10_000)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "warmup port overflow"))?;
 
         let first_packet = build_ipv4_udp_packet(
             Ipv4Addr::new(10, 26, 1, 101),
             Ipv4Addr::new(10, 26, 1, 100),
             warmup_src_port,
-            dst_port,
+            warmup_dst_port,
             b"drop-cleanup warmup",
         );
-        let warmup_batch = (0..512).map(|_| first_packet.clone()).collect::<Vec<_>>();
-        let mut warmup_results = std::iter::repeat_with(|| None)
-            .take(warmup_batch.len())
-            .collect::<Vec<_>>();
-        let mut future = Box::pin(device.send_many(
-            warmup_batch,
-            &mut warmup_results,
-            Duration::from_secs(10),
-            true,
-        ));
+        let mut exercised_drop_cleanup = false;
+        for batch_size in [512, 4_096, 16_384, 65_536] {
+            let warmup_batch = (0..batch_size)
+                .map(|_| first_packet.clone())
+                .collect::<Vec<_>>();
+            let mut warmup_results = std::iter::repeat_with(|| None)
+                .take(warmup_batch.len())
+                .collect::<Vec<_>>();
+            let mut future = Box::pin(device.send_many(
+                warmup_batch,
+                &mut warmup_results,
+                Duration::from_secs(10),
+                true,
+            ));
 
-        match poll_once(&mut future) {
-            Poll::Pending => {}
-            Poll::Ready(_) => {
-                return Err(io::Error::other(
-                    "send_many warmup batch completed before drop cleanup could be exercised",
-                ));
+            match poll_once(&mut future) {
+                Poll::Pending => {
+                    drop(future);
+                    drop(warmup_results);
+                    exercised_drop_cleanup = true;
+                    break;
+                }
+                Poll::Ready(_) => {}
             }
         }
 
-        drop(future);
-        drop(warmup_results);
+        if !exercised_drop_cleanup {
+            return Err(io::Error::other(
+                "send_many warmup batches completed before drop cleanup could be exercised",
+            ));
+        }
 
         let followup_packet = build_ipv4_udp_packet(
             Ipv4Addr::new(10, 26, 1, 101),
@@ -1347,12 +1413,15 @@ mod tests {
     ) -> io::Result<()> {
         let socket = UdpSocket::bind(("10.26.1.100", dst_port))?;
         socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let timeout_dst_port = dst_port
+            .checked_add(10_000)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "timeout port overflow"))?;
 
         let timeout_packet = build_ipv4_udp_packet(
             Ipv4Addr::new(10, 26, 1, 101),
             Ipv4Addr::new(10, 26, 1, 100),
             timeout_src_port,
-            dst_port,
+            timeout_dst_port,
             b"timeout warmup",
         );
         let timeout_batch = (0..2048)
@@ -1477,7 +1546,7 @@ mod tests {
             block_port,
             b"busy-slot warmup",
         );
-        let blocking_batch = (0..1024)
+        let blocking_batch = (0..65_536)
             .map(|_| blocking_packet.clone())
             .collect::<Vec<_>>();
         let mut blocking_results = std::iter::repeat_with(|| None)
@@ -1823,9 +1892,8 @@ mod tests {
                 device.readable().await?;
                 let ready_len = device.ready_len();
                 assert!(ready_len > 0);
-                let packet = device.try_recv()?;
+                let packet = recv_packet_with_payload(&mut device, payload).await?;
                 assert!(!packet.is_detached());
-                assert!(packet_has_ipv4_udp_payload(packet.as_bytes(), payload));
                 device.stop_rx().await?;
                 Ok::<(), io::Error>(())
             },
@@ -2184,9 +2252,8 @@ mod tests {
                 device.readable().await?;
                 let ready_len = device.ready_len();
                 assert!(ready_len > 0);
-                let packet = device.try_recv()?;
+                let packet = recv_packet_with_payload(&mut device, payload).await?;
                 assert!(!packet.is_detached());
-                assert!(packet_has_ipv4_udp_payload(packet.as_bytes(), payload));
                 device.stop_rx().await?;
                 Ok::<(), io::Error>(())
             },

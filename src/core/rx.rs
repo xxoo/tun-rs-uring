@@ -39,9 +39,10 @@ pub enum RxStartMode {
     ManualStart,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum RxState {
     Running,
+    #[default]
     Stopped,
     Faulted(Arc<io::Error>),
 }
@@ -86,28 +87,31 @@ pub(crate) struct RxController<D = RxDriverHandle> {
     driver: D,
 }
 
+pub(crate) struct RxControllerConfig {
+    pub(crate) device: OwnedFd,
+    pub(crate) ring_entries: u32,
+    pub(crate) buffer_len: usize,
+    pub(crate) buffer_count: usize,
+    pub(crate) packets_include_virtio_net_hdr: bool,
+    pub(crate) auto_resume_after_recycled_slots: usize,
+    pub(crate) start_mode: RxStartMode,
+    pub(crate) thread_name: &'static str,
+}
+
 impl RxController<RxDriverHandle> {
-    pub(crate) fn new(
-        device: OwnedFd,
-        ring_entries: u32,
-        buffer_len: usize,
-        buffer_count: usize,
-        packets_include_virtio_net_hdr: bool,
-        auto_resume_after_recycled_slots: usize,
-        start_mode: RxStartMode,
-        thread_name: &'static str,
-    ) -> io::Result<Self> {
+    pub(crate) fn new(config: RxControllerConfig) -> io::Result<Self> {
         let shared = RxShared::default();
-        let driver = RxDriverHandle::spawn(
-            device,
-            ring_entries,
-            buffer_len,
-            buffer_count,
-            packets_include_virtio_net_hdr,
-            auto_resume_after_recycled_slots,
-            shared.clone(),
-            thread_name,
-        )?;
+        let start_mode = config.start_mode;
+        let driver = RxDriverHandle::spawn(RxDriverConfig {
+            device: config.device,
+            ring_entries: config.ring_entries,
+            buffer_len: config.buffer_len,
+            buffer_count: config.buffer_count,
+            packets_include_virtio_net_hdr: config.packets_include_virtio_net_hdr,
+            auto_resume_after_recycled_slots: config.auto_resume_after_recycled_slots,
+            shared: shared.clone(),
+            thread_name: config.thread_name,
+        })?;
         let mut controller = Self { shared, driver };
 
         if matches!(start_mode, RxStartMode::AutoStart) {
@@ -230,12 +234,6 @@ struct RxSharedState {
     state: RxState,
     packets: VecDeque<Packet>,
     waiter: RxWaiterSlot,
-}
-
-impl Default for RxState {
-    fn default() -> Self {
-        Self::Stopped
-    }
 }
 
 impl RxShared {
@@ -824,18 +822,19 @@ impl RxDriverThread {
     }
 
     fn try_auto_resume(&mut self) -> io::Result<()> {
-        if self.read_active
-            || !self
-                .auto_resume
-                .inner
-                .pending_enobufs
-                .load(Ordering::Acquire)
+        if !self
+            .auto_resume
+            .inner
+            .pending_enobufs
+            .load(Ordering::Acquire)
         {
             return Ok(());
         }
 
-        self.submit_multishot_read()?;
         self.running = true;
+        if !self.read_active {
+            self.submit_multishot_read()?;
+        }
         self.auto_resume.disarm();
         self.shared.set_running();
         Ok(())
@@ -1019,34 +1018,36 @@ pub(crate) struct RxDriverHandle {
     thread: Option<JoinHandle<()>>,
 }
 
+struct RxDriverConfig {
+    device: OwnedFd,
+    ring_entries: u32,
+    buffer_len: usize,
+    buffer_count: usize,
+    packets_include_virtio_net_hdr: bool,
+    auto_resume_after_recycled_slots: usize,
+    shared: RxShared,
+    thread_name: &'static str,
+}
+
 impl RxDriverHandle {
-    fn spawn(
-        device: OwnedFd,
-        ring_entries: u32,
-        buffer_len: usize,
-        buffer_count: usize,
-        packets_include_virtio_net_hdr: bool,
-        auto_resume_after_recycled_slots: usize,
-        shared: RxShared,
-        thread_name: &'static str,
-    ) -> io::Result<Self> {
-        let ring = RxRingContext::new(ring_entries, buffer_len, buffer_count)?;
+    fn spawn(config: RxDriverConfig) -> io::Result<Self> {
+        let ring = RxRingContext::new(config.ring_entries, config.buffer_len, config.buffer_count)?;
         let (commands_tx, commands_rx) = async_channel::unbounded();
         let command_eventfd_read = new_eventfd()?;
         let command_eventfd_write = dup_fd(&command_eventfd_read)?;
         let auto_resume = RxAutoResume::new(
-            auto_resume_after_recycled_slots,
+            config.auto_resume_after_recycled_slots,
             commands_tx.clone(),
             dup_fd(&command_eventfd_read)?,
         );
 
         let thread = thread::Builder::new()
-            .name(thread_name.to_string())
+            .name(config.thread_name.to_string())
             .spawn(move || {
                 RxDriverThread {
                     ring,
-                    device,
-                    shared,
+                    device: config.device,
+                    shared: config.shared,
                     commands: commands_rx,
                     command_eventfd: command_eventfd_read,
                     running: false,
@@ -1054,7 +1055,7 @@ impl RxDriverHandle {
                     stop_ack: None,
                     shutdown_requested: false,
                     auto_resume,
-                    packets_include_virtio_net_hdr,
+                    packets_include_virtio_net_hdr: config.packets_include_virtio_net_hdr,
                 }
                 .run();
             })?;
@@ -1062,7 +1063,7 @@ impl RxDriverHandle {
         Ok(Self {
             commands: commands_tx,
             command_eventfd: command_eventfd_write,
-            thread_name,
+            thread_name: config.thread_name,
             thread: Some(thread),
         })
     }
