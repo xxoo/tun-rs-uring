@@ -10,11 +10,12 @@ mod tx;
 
 use bytes::Bytes;
 use std::fmt;
+use std::fs::OpenOptions;
 use std::future::Future;
 use std::io;
 #[cfg(any(feature = "async_tokio", feature = "async_io"))]
 use std::os::fd::RawFd;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Duration;
 use tun_rs::SyncDevice;
@@ -37,6 +38,23 @@ pub(crate) struct CoreDevice {
     packets_include_virtio_net_hdr: bool,
     rx: RxController,
     tx: TxController,
+}
+
+const FALLBACK_TUN_FLAGS: u16 = (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_MULTI_QUEUE) as u16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NamespaceIdentity {
+    device: libc::dev_t,
+    inode: libc::ino_t,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TunIdentity {
+    raw_name: [u8; libc::IFNAMSIZ],
+    effective_flags: u16,
+    if_index: u32,
+    device_netns: NamespaceIdentity,
+    thread_netns: NamespaceIdentity,
 }
 
 #[allow(dead_code)]
@@ -139,7 +157,13 @@ impl CoreDevice {
     }
 
     pub(crate) fn try_clone_device(&self) -> std::io::Result<SyncDevice> {
-        self.device.try_clone()
+        match self.device.try_clone() {
+            Ok(device) => Ok(device),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                clone_plain_multiqueue_from_fd(&self.device)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn config(&self) -> UringDeviceConfig {
@@ -149,6 +173,132 @@ impl CoreDevice {
     pub(crate) fn duplicate_fd(&self) -> std::io::Result<OwnedFd> {
         duplicate_device_fd(&self.device)
     }
+}
+
+fn clone_plain_multiqueue_from_fd(device: &SyncDevice) -> io::Result<SyncDevice> {
+    let source_before = tun_identity(device.as_raw_fd())?;
+    validate_fallback_source(source_before)?;
+
+    let new_fd: OwnedFd = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/net/tun")?
+        .into();
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            source_before.raw_name.as_ptr(),
+            request.ifr_name.as_mut_ptr().cast(),
+            libc::IFNAMSIZ,
+        );
+    }
+    request.ifr_ifru.ifru_flags = FALLBACK_TUN_FLAGS as libc::c_short;
+
+    if unsafe { libc::ioctl(new_fd.as_raw_fd(), libc::TUNSETIFF, &mut request) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let source_after = tun_identity(device.as_raw_fd())?;
+    let attached = tun_identity(new_fd.as_raw_fd())?;
+    validate_attached_queue(source_before, source_after, attached)?;
+
+    unsafe { SyncDevice::from_fd(new_fd.into_raw_fd()) }
+}
+
+fn validate_fallback_source(identity: TunIdentity) -> io::Result<()> {
+    if identity.effective_flags != FALLBACK_TUN_FLAGS
+        || identity.if_index == 0
+        || identity.device_netns != identity.thread_netns
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "device is not eligible for the multi-queue compatibility path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_attached_queue(
+    source_before: TunIdentity,
+    source_after: TunIdentity,
+    attached: TunIdentity,
+) -> io::Result<()> {
+    validate_fallback_source(source_after)?;
+    validate_fallback_source(attached)?;
+    if source_before != source_after || source_before != attached {
+        return Err(io::Error::other(
+            "TUN identity changed while attaching a queue",
+        ));
+    }
+    Ok(())
+}
+
+fn tun_identity(fd: libc::c_int) -> io::Result<TunIdentity> {
+    let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(fd, libc::TUNGETIFF, &mut request) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut raw_name = [0; libc::IFNAMSIZ];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            request.ifr_name.as_ptr().cast(),
+            raw_name.as_mut_ptr(),
+            libc::IFNAMSIZ,
+        );
+    }
+    if raw_name.first() == Some(&0) || !raw_name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "TUNGETIFF returned an invalid interface name",
+        ));
+    }
+
+    let device_netns = device_netns_identity(fd)?;
+    let thread_netns_file = std::fs::File::open("/proc/thread-self/ns/net")?;
+    let thread_netns = namespace_identity(thread_netns_file.as_raw_fd())?;
+    if device_netns != thread_netns {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "TUN device and caller are in different network namespaces",
+        ));
+    }
+
+    let if_index = unsafe { libc::if_nametoindex(request.ifr_name.as_ptr()) };
+    if if_index == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "TUN interface index is unavailable",
+        ));
+    }
+
+    Ok(TunIdentity {
+        raw_name,
+        effective_flags: unsafe { request.ifr_ifru.ifru_flags as u16 },
+        if_index,
+        device_netns,
+        thread_netns,
+    })
+}
+
+fn device_netns_identity(fd: libc::c_int) -> io::Result<NamespaceIdentity> {
+    let namespace_fd = unsafe { libc::ioctl(fd, libc::TUNGETDEVNETNS) };
+    if namespace_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let namespace_fd = unsafe { OwnedFd::from_raw_fd(namespace_fd) };
+    namespace_identity(namespace_fd.as_raw_fd())
+}
+
+fn namespace_identity(fd: libc::c_int) -> io::Result<NamespaceIdentity> {
+    let mut status: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut status) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(NamespaceIdentity {
+        device: status.st_dev,
+        inode: status.st_ino,
+    })
 }
 
 impl fmt::Debug for CoreDevice {
@@ -184,4 +334,65 @@ pub(crate) fn write_fd(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     }
 
     Ok(written as usize)
+}
+
+#[cfg(test)]
+mod clone_fallback_tests {
+    use super::*;
+
+    fn identity() -> TunIdentity {
+        let mut raw_name = [0; libc::IFNAMSIZ];
+        raw_name[..5].copy_from_slice(b"linq0");
+        TunIdentity {
+            raw_name,
+            effective_flags: FALLBACK_TUN_FLAGS,
+            if_index: 7,
+            device_netns: NamespaceIdentity {
+                device: 3,
+                inode: 11,
+            },
+            thread_netns: NamespaceIdentity {
+                device: 3,
+                inode: 11,
+            },
+        }
+    }
+
+    #[test]
+    fn fallback_seam_accepts_only_unchanged_plain_multiqueue_tun() {
+        let expected = identity();
+        assert!(validate_fallback_source(expected).is_ok());
+        assert!(validate_attached_queue(expected, expected, expected).is_ok());
+
+        for forbidden in [
+            libc::IFF_TAP,
+            libc::IFF_VNET_HDR,
+            libc::IFF_NAPI,
+            libc::IFF_NAPI_FRAGS,
+            libc::IFF_TUN_EXCL,
+            libc::IFF_PERSIST,
+            0x0040,
+        ] {
+            let mut candidate = expected;
+            candidate.effective_flags |= forbidden as u16;
+            assert_eq!(
+                validate_fallback_source(candidate)
+                    .expect_err("forbidden flag must be rejected")
+                    .kind(),
+                io::ErrorKind::Unsupported
+            );
+        }
+
+        let mut candidate = expected;
+        candidate.if_index += 1;
+        assert!(validate_attached_queue(expected, expected, candidate).is_err());
+
+        let mut candidate = expected;
+        candidate.raw_name[0] = b'x';
+        assert!(validate_attached_queue(expected, expected, candidate).is_err());
+
+        let mut candidate = expected;
+        candidate.device_netns.inode += 1;
+        assert!(validate_fallback_source(candidate).is_err());
+    }
 }
