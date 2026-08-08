@@ -41,6 +41,7 @@ pub(crate) struct CoreDevice {
 }
 
 const FALLBACK_TUN_FLAGS: u16 = (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_MULTI_QUEUE) as u16;
+const FALLBACK_PERSISTENT_TUN_FLAGS: u16 = FALLBACK_TUN_FLAGS | libc::IFF_PERSIST as u16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NamespaceIdentity {
@@ -206,8 +207,10 @@ fn clone_plain_multiqueue_from_fd(device: &SyncDevice) -> io::Result<SyncDevice>
 }
 
 fn validate_fallback_source(identity: TunIdentity) -> io::Result<()> {
-    if identity.effective_flags != FALLBACK_TUN_FLAGS
-        || identity.if_index == 0
+    if !matches!(
+        identity.effective_flags,
+        FALLBACK_TUN_FLAGS | FALLBACK_PERSISTENT_TUN_FLAGS
+    ) || identity.if_index == 0
         || identity.device_netns != identity.thread_netns
     {
         return Err(io::Error::new(
@@ -364,13 +367,19 @@ mod clone_fallback_tests {
         assert!(validate_fallback_source(expected).is_ok());
         assert!(validate_attached_queue(expected, expected, expected).is_ok());
 
+        let persistent = TunIdentity {
+            effective_flags: FALLBACK_PERSISTENT_TUN_FLAGS,
+            ..expected
+        };
+        assert!(validate_fallback_source(persistent).is_ok());
+        assert!(validate_attached_queue(persistent, persistent, persistent).is_ok());
+
         for forbidden in [
             libc::IFF_TAP,
             libc::IFF_VNET_HDR,
             libc::IFF_NAPI,
             libc::IFF_NAPI_FRAGS,
             libc::IFF_TUN_EXCL,
-            libc::IFF_PERSIST,
             0x0040,
         ] {
             let mut candidate = expected;
