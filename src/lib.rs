@@ -866,10 +866,23 @@ mod tests {
         thread::sleep(Duration::from_millis(60));
         let receive = (|| -> io::Result<()> {
             device.start_rx()?;
+            let deadline = Instant::now() + Duration::from_secs(3);
             loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out waiting for sustained manual restart; state={:?}",
+                            device.rx_state()
+                        ),
+                    ));
+                }
                 match block_on_timeout(
                     recv_packet_with_payload(device, payload),
-                    Duration::from_millis(500),
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(Duration::from_millis(500)),
                 ) {
                     Some(Ok(packet)) => {
                         assert!(!packet.is_detached());
