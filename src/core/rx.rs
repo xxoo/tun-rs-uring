@@ -78,7 +78,7 @@ impl RxState {
 }
 
 pub(crate) trait RxDriverOps {
-    fn start_sync(&self) -> io::Result<()>;
+    fn start_sync(&self, shared: &RxShared) -> io::Result<()>;
     fn stop_async(&self) -> DriverFuture<'_>;
 }
 
@@ -143,11 +143,8 @@ where
             return Ok(());
         }
 
-        match self.driver.start_sync() {
-            Ok(()) => {
-                self.shared.set_running();
-                Ok(())
-            }
+        match self.driver.start_sync(&self.shared) {
+            Ok(()) => Ok(()),
             Err(error) => {
                 self.shared.set_faulted(error::clone_io_error(&error));
                 Err(error)
@@ -225,7 +222,7 @@ where
 }
 
 #[derive(Clone, Default)]
-struct RxShared {
+pub(crate) struct RxShared {
     inner: Arc<Mutex<RxSharedState>>,
 }
 
@@ -798,8 +795,12 @@ impl RxDriverThread {
         self.auto_resume.disarm();
         self.running = true;
         if !self.read_active {
-            self.submit_multishot_read()?;
+            if let Err(error) = self.submit_multishot_read() {
+                self.running = false;
+                return Err(error);
+            }
         }
+        self.shared.set_running();
         Ok(())
     }
 
@@ -1078,7 +1079,7 @@ impl RxDriverHandle {
 }
 
 impl RxDriverOps for RxDriverHandle {
-    fn start_sync(&self) -> io::Result<()> {
+    fn start_sync(&self, _shared: &RxShared) -> io::Result<()> {
         let (ack_tx, ack_rx) = async_channel::bounded(1);
         self.send_command(RxDriverCommand::Start { ack: ack_tx })?;
         ack_rx
@@ -1256,11 +1257,12 @@ mod tests {
     }
 
     impl RxDriverOps for FakeDriver {
-        fn start_sync(&self) -> io::Result<()> {
+        fn start_sync(&self, shared: &RxShared) -> io::Result<()> {
             self.starts.fetch_add(1, Ordering::SeqCst);
             if self.fail_start.load(Ordering::SeqCst) {
                 Err(io::Error::other("start failed"))
             } else {
+                shared.set_running();
                 Ok(())
             }
         }
@@ -1275,6 +1277,20 @@ mod tests {
                     Ok(())
                 }
             })
+        }
+    }
+
+    struct FaultingStartDriver;
+
+    impl RxDriverOps for FaultingStartDriver {
+        fn start_sync(&self, shared: &RxShared) -> io::Result<()> {
+            shared.set_running();
+            shared.set_faulted(io::Error::from_raw_os_error(libc::ENOBUFS));
+            Ok(())
+        }
+
+        fn stop_async(&self) -> DriverFuture<'_> {
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -1423,6 +1439,21 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert!(matches!(controller.state(), RxState::Faulted(_)));
+    }
+
+    #[test]
+    fn successful_start_preserves_newer_driver_fault() {
+        let mut controller = RxController {
+            shared: RxShared::default(),
+            driver: FaultingStartDriver,
+        };
+
+        controller.start().unwrap();
+
+        let RxState::Faulted(error) = controller.state() else {
+            panic!("driver fault was overwritten after start returned");
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::ENOBUFS));
     }
 
     #[test]

@@ -861,24 +861,61 @@ mod tests {
             libc::ENOBUFS
         ));
 
-        device.start_rx()?;
-        assert!(matches!(device.rx_state(), RxState::Running));
+        let (stop, continuous_sender) =
+            spawn_ipv4_udp_sender("10.26.1.100:0", &target_addr, payload);
+        thread::sleep(Duration::from_millis(60));
+        let receive = (|| -> io::Result<()> {
+            device.start_rx()?;
+            loop {
+                match block_on_timeout(
+                    recv_packet_with_payload(device, payload),
+                    Duration::from_millis(500),
+                ) {
+                    Some(Ok(packet)) => {
+                        assert!(!packet.is_detached());
+                        return Ok(());
+                    }
+                    Some(Err(error)) if error.raw_os_error() == Some(libc::ENOBUFS) => {
+                        device.start_rx()?;
+                    }
+                    Some(Err(error)) => return Err(error),
+                    None => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "rx made no progress during sustained manual restart",
+                        ));
+                    }
+                }
+            }
+        })();
 
-        let packet = block_on_timeout(
-            recv_packet_with_payload(device, payload),
-            Duration::from_secs(3),
-        )
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "timed out receiving packet after manual restart",
-            )
-        })??;
-        assert!(!packet.is_detached());
-        drop(packet);
+        stop.store(true, Ordering::Release);
+        continuous_sender.join().unwrap()?;
+        receive?;
 
-        block_on_timeout(async { device.stop_rx().await }, Duration::from_secs(2))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "timed out stopping rx"))??;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out stopping sustained manual restart",
+                ));
+            }
+            match device.try_recv() {
+                Ok(packet) => drop(packet),
+                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => device.start_rx()?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    block_on_timeout(device.stop_rx(), Duration::from_millis(500)).ok_or_else(
+                        || io::Error::new(io::ErrorKind::TimedOut, "timed out stopping rx"),
+                    )??;
+                    if matches!(device.rx_state(), RxState::Stopped) {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => break,
+                Err(error) => return Err(error),
+            }
+        }
         assert!(matches!(device.rx_state(), RxState::Stopped));
         drain_stopped_rx_queue(device, payload)?;
 
