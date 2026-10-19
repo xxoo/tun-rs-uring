@@ -878,6 +878,13 @@ impl RxDriverThread {
     }
 
     fn wait_for_activity(&mut self) -> io::Result<()> {
+        // An eventfd notification may already have been consumed while a CQE
+        // was still in the kernel's overflow list. Do not sleep with pending
+        // completions, even if the eventfd is no longer readable.
+        if !self.ring.ring.completion().is_empty() || self.ring.ring.submission().cq_overflow() {
+            return self.process_cqes();
+        }
+
         let mut fds = [
             libc::pollfd {
                 fd: self.command_eventfd.as_raw_fd(),
@@ -918,20 +925,35 @@ impl RxDriverThread {
     }
 
     fn process_cqes(&mut self) -> io::Result<()> {
-        let entries: Vec<cqueue::Entry> = {
-            let completion = self.ring.ring.completion();
-            completion.collect()
-        };
+        loop {
+            let entries: Vec<cqueue::Entry> = {
+                let completion = self.ring.ring.completion();
+                completion.collect()
+            };
 
-        for entry in entries {
-            match entry.user_data() {
-                RX_READ_USER_DATA => self.handle_read_cqe(entry)?,
-                RX_CANCEL_USER_DATA => self.handle_cancel_cqe(entry)?,
-                _ => {}
+            for entry in entries {
+                match entry.user_data() {
+                    RX_READ_USER_DATA => self.handle_read_cqe(entry)?,
+                    RX_CANCEL_USER_DATA => self.handle_cancel_cqe(entry)?,
+                    _ => {}
+                }
+            }
+
+            if !self.ring.ring.submission().cq_overflow() {
+                return Ok(());
+            }
+
+            // Dropping the CQ above publishes its head and frees space. An
+            // overflow can contain the terminal multishot CQE, so explicitly
+            // enter the kernel to flush it and then reap it before waiting.
+            // submit() uses GETEVENTS on overflow without waiting for new I/O.
+            self.drain_commands()?;
+            match self.ring.ring.submit() {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
             }
         }
-
-        Ok(())
     }
 
     fn handle_read_cqe(&mut self, entry: cqueue::Entry) -> io::Result<()> {
@@ -1221,8 +1243,9 @@ fn signal_eventfd(fd: i32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        new_eventfd, DriverFuture, RxAutoResume, RxController, RxDriverCommand, RxDriverOps,
-        RxRingContext, RxShared, RxStartMode, RxState, RxWaiterSlot,
+        drain_eventfd, dup_fd, new_eventfd, signal_eventfd, DriverFuture, RxAutoResume,
+        RxController, RxDriverCommand, RxDriverOps, RxDriverThread, RxRingContext, RxShared,
+        RxStartMode, RxState, RxWaiterSlot,
     };
     use crate::{
         core::testutil::{block_on_immediate, WakeCounter},
@@ -1231,11 +1254,14 @@ mod tests {
     use async_channel::TryRecvError;
     use std::{
         io,
+        os::{fd::AsRawFd, unix::net::UnixDatagram},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
         task::{Context, Poll},
+        thread,
+        time::{Duration, Instant},
     };
 
     #[derive(Debug, Default)]
@@ -1345,6 +1371,174 @@ mod tests {
             Err(error) if supports_live_rx_driver_tests(&error) => {}
             Err(error) => panic!("unexpected rx ring init failure: {error}"),
         }
+    }
+
+    fn live_overflow_driver() -> Option<(RxDriverThread, UnixDatagram)> {
+        // One SQ entry gives us two CQ slots. More provided buffers ensure the
+        // test hits CQ overflow rather than buffer exhaustion.
+        let ring = match RxRingContext::new(1, 64, 32) {
+            Ok(ring) => ring,
+            Err(error)
+                if supports_live_rx_driver_tests(&error)
+                    && !std::env::var("TUN_RS_URING_REQUIRE_LIVE").is_ok_and(|value| {
+                        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+                    }) =>
+            {
+                eprintln!("skipping live RX overflow test: {error}");
+                return None;
+            }
+            Err(error) => panic!("live RX overflow test requires io_uring: {error}"),
+        };
+        assert!(ring.ring.params().is_feature_nodrop());
+        let (receiver, sender) = UnixDatagram::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        sender.set_nonblocking(true).unwrap();
+        let (commands_tx, commands_rx) = async_channel::unbounded();
+        let command_eventfd = new_eventfd().unwrap();
+        let auto_resume = RxAutoResume::new(0, commands_tx, dup_fd(&command_eventfd).unwrap());
+        let mut driver = RxDriverThread {
+            ring,
+            device: receiver.into(),
+            shared: RxShared::default(),
+            commands: commands_rx,
+            command_eventfd,
+            running: false,
+            read_active: false,
+            stop_ack: None,
+            shutdown_requested: false,
+            auto_resume,
+            packets_include_virtio_net_hdr: false,
+        };
+        driver.start_rx().unwrap();
+        Some((driver, sender))
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for live RX completion"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn overflow_rx(driver: &mut RxDriverThread, sender: &UnixDatagram) -> usize {
+        let capacity = driver.ring.ring.completion().capacity();
+        assert_eq!(capacity, 2);
+        for value in 0..=capacity {
+            sender.send(&[value as u8]).unwrap();
+        }
+        // Do not enter io_uring or consume CQEs until the real kernel overflow
+        // flag is set. The third packet's terminal CQE must be flushed later.
+        wait_until(|| driver.ring.ring.submission().cq_overflow());
+        assert_eq!(driver.ring.ring.completion().len(), capacity);
+        capacity + 1
+    }
+
+    fn receive_after_overflow(driver: &mut RxDriverThread, sender: &UnixDatagram) {
+        sender.send(b"after overflow").unwrap();
+        wait_until(|| !driver.ring.ring.completion().is_empty());
+        driver.process_cqes().unwrap();
+        assert_eq!(
+            driver.shared.try_recv().unwrap().as_bytes(),
+            b"after overflow"
+        );
+    }
+
+    #[test]
+    fn live_rx_cq_overflow_flushes_terminal_completion_and_rearms() {
+        let Some((mut driver, sender)) = live_overflow_driver() else {
+            return;
+        };
+        let count = overflow_rx(&mut driver, &sender);
+        driver.process_cqes().unwrap();
+        assert!(!driver.ring.ring.submission().cq_overflow());
+        assert_eq!(driver.shared.ready_len(), count);
+        for value in 0..count {
+            assert_eq!(driver.shared.try_recv().unwrap().as_bytes(), &[value as u8]);
+        }
+        receive_after_overflow(&mut driver, &sender);
+    }
+
+    #[test]
+    fn live_rx_cq_overflow_is_processed_without_an_eventfd_notification() {
+        let Some((mut driver, sender)) = live_overflow_driver() else {
+            return;
+        };
+        let count = overflow_rx(&mut driver, &sender);
+        drain_eventfd(driver.ring.eventfd_raw_fd()).unwrap();
+
+        // Bound the old implementation's infinite poll without supplying a CQ
+        // notification that could accidentally make it pass the regression.
+        let wake_fd = dup_fd(&driver.command_eventfd).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let watchdog = thread::spawn(move || {
+            if done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                signal_eventfd(wake_fd.as_raw_fd()).unwrap();
+                false
+            } else {
+                true
+            }
+        });
+        let result = driver.wait_for_activity();
+        let _ = done_tx.send(());
+        let returned_without_watchdog = watchdog.join().unwrap();
+        result.unwrap();
+        assert!(
+            returned_without_watchdog,
+            "RX slept with a pending overflow"
+        );
+        assert!(!driver.ring.ring.submission().cq_overflow());
+        assert_eq!(driver.shared.ready_len(), count);
+    }
+
+    #[test]
+    fn live_rx_cq_overflow_stop_and_restart_complete() {
+        let Some((mut driver, sender)) = live_overflow_driver() else {
+            return;
+        };
+        let count = overflow_rx(&mut driver, &sender);
+        let (ack_tx, ack_rx) = async_channel::bounded(1);
+        driver.begin_stop(ack_tx).unwrap();
+        wait_until(|| {
+            driver.process_cqes().unwrap();
+            !driver.read_active
+        });
+        ack_rx.try_recv().unwrap().unwrap();
+        assert!(!driver.running);
+        assert!(matches!(driver.shared.state(), RxState::Stopped));
+        assert!(!driver.ring.ring.submission().cq_overflow());
+        assert_eq!(driver.shared.ready_len(), count);
+        for _ in 0..count {
+            drop(driver.shared.try_recv().unwrap());
+        }
+        driver.start_rx().unwrap();
+        receive_after_overflow(&mut driver, &sender);
+    }
+
+    #[test]
+    fn live_rx_cq_overflow_services_queued_shutdown_without_more_packets() {
+        let Some((mut driver, sender)) = live_overflow_driver() else {
+            return;
+        };
+        let count = overflow_rx(&mut driver, &sender);
+        driver
+            .auto_resume
+            .inner
+            .commands
+            .send_blocking(RxDriverCommand::Shutdown)
+            .unwrap();
+
+        // While flushing overflow, the driver must service commands instead
+        // of rearming the read indefinitely under a sustained packet stream.
+        driver.process_cqes().unwrap();
+        assert!(driver.shutdown_requested);
+        assert!(!driver.running);
+        assert!(!driver.read_active);
+        assert!(!driver.ring.ring.submission().cq_overflow());
+        assert_eq!(driver.shared.ready_len(), count);
     }
 
     #[test]
