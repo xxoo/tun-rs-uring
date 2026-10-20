@@ -22,5 +22,5 @@ async-io = { version = "2.3", optional = true }
 bytes = "1"
 io-uring = "0.7"
 libc = "0.2"
-tokio = { version = "1.49", features = ["net", "rt", "time"], optional = true }
+tokio = { version = "1.53.3", features = ["net", "rt", "time"], optional = true }
 tun-rs = { git = "https://github.com/xxoo/tun-rs.git", branch = "codex/linq-wintun-exact-lifecycle-2.8.7", version = "2.8.7" }
