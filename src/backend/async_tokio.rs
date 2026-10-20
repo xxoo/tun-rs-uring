@@ -15,7 +15,10 @@ pub(crate) struct BackendDevice {
 impl BackendDevice {
     pub(crate) fn new_impl(device: SyncDevice, config: UringDeviceConfig) -> io::Result<Self> {
         let core = CoreDevice::new(device, config, "uring-rx-tokio")?;
-        let io = AsyncFd::new(core.duplicate_fd()?)?;
+        let fd = core.duplicate_fd()?;
+        // SAFETY: AsyncFd owns this duplicated OwnedFd. Its descriptor stays
+        // open and unchanged until AsyncFd deregisters and drops it.
+        let io = unsafe { AsyncFd::register(fd) }?;
 
         Ok(Self { core, io })
     }
